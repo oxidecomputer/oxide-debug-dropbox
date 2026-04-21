@@ -797,6 +797,42 @@ mod tests {
         test_dir.cleanup();
     }
 
+    /// Test cancelling a deposit when the file has already been collected
+    /// (deleted by the archiver).
+    ///
+    /// `cancel_and_attempt_delete` is best-effort and must not panic or
+    /// return an error when the file is already gone.
+    #[tokio::test]
+    async fn test_cancel_already_gone() {
+        let log = new_test_log();
+        let test_dir = TestDir::new();
+
+        let dropbox = DebugDropbox::for_tests(&log, test_dir.path())
+            .await
+            .expect("failed to create dropbox");
+        let producer = dropbox
+            .initialize_producer("canceller")
+            .await
+            .expect("failed to init producer");
+
+        let handle = producer
+            .deposit_file_str("state.json", "{}")
+            .await
+            .expect("failed to deposit");
+
+        // Simulate the archiver collecting and deleting the file.
+        let deposited = test_dir.path().join("canceller").join("state.json");
+        tokio::fs::remove_file(&deposited)
+            .await
+            .expect("failed to simulate archival");
+
+        // cancel_and_attempt_delete should not panic even though the file
+        // is already gone.
+        handle.cancel_and_attempt_delete().await;
+
+        test_dir.cleanup();
+    }
+
     /// Test that invalid producer names are rejected.
     ///
     /// The noop dropbox validates names before checking the dropbox kind,
