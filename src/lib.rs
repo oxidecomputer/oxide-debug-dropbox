@@ -28,7 +28,6 @@
 //! use anyhow::Context;
 //! use omicron_debug_dropbox::DebugDropbox;
 //! use slog::Logger;
-//! use std::sync::Arc;
 //!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), anyhow::Error> {
@@ -265,12 +264,12 @@ impl DebugDropbox {
     /// However, a given subsystem should consistently use the same name (i.e.,
     /// don't include the pid or another changing value in the producer name).
     ///
-    /// The producer name will become a directory name, so it cannot contain '/'
-    /// or be the strings `"."` or `".."`.  The producer name "tmp" is also
-    /// reserved.
+    /// The producer name will become a directory name, so it cannot be empty,
+    /// cannot contain '/', and cannot be the strings `"."` or `".."`.  The
+    /// producer name "tmp" is also reserved.
     pub async fn initialize_producer(
         &self,
-        producer: &'static str,
+        producer: &str,
     ) -> Result<Producer, ProducerInitError> {
         // Do the validation even for `Noop` dropboxes.
 
@@ -289,7 +288,7 @@ impl DebugDropbox {
                     "producer" => producer,
                 );
                 Ok(Producer {
-                    log: self.log.new(o!("producer" => producer)),
+                    log: self.log.new(o!("producer" => producer.to_owned())),
                     kind: ProducerKind::Noop,
                 })
             }
@@ -297,7 +296,7 @@ impl DebugDropbox {
             DebugDropboxKind::Normal { path } => {
                 let tmp_path = path.join("tmp").join(&producer_name);
                 let producer_path = path.join(&producer_name);
-                let log = self.log.new(o!("producer" => producer));
+                let log = self.log.new(o!("producer" => producer.to_owned()));
                 info!(
                     log,
                     "initializing debug dropbox producer";
@@ -374,11 +373,11 @@ impl Producer {
     /// one is archived), the new one may overwrite the previous one.  Archived
     /// files are given unique names, so you don't have to worry about ensuring
     /// uniqueness over all time.
-    pub async fn deposit_file_str<'a>(
-        &'a self,
+    pub async fn deposit_file_str(
+        &self,
         name: &str,
         contents: &str,
-    ) -> Result<DepositHandle<'a>, DepositError> {
+    ) -> Result<DepositHandle, DepositError> {
         // Validate the name even in Noop mode so that at least this part gets
         // covered in testing.
         let validated = Basename::try_from(name)?;
@@ -390,7 +389,7 @@ impl Producer {
                     "skipping debug dropbox drop (noop impl)";
                     "name" => name,
                 );
-                Ok(DepositHandle::Noop)
+                Ok(DepositHandle::noop())
             }
             ProducerKind::Normal { path, tmp_path } => {
                 let tmp_file_path = tmp_path.join(&validated);
@@ -434,7 +433,7 @@ impl Producer {
                         })?;
                 }
 
-                Ok(DepositHandle::new(final_path, &self.log))
+                Ok(DepositHandle::new(final_path, self.log.clone()))
             }
         }
     }
@@ -442,12 +441,16 @@ impl Producer {
 
 /// A filesystem path component that's not '.' or '..'
 ///
-/// A `Basename` must not contain "/" or be either of the strings "." or "..".
+/// A `Basename` must not be empty, must not contain "/", and must not be either
+/// of the strings "." or "..".
 #[derive(AsRef, Clone, Debug)]
 pub struct Basename<'a>(Cow<'a, str>);
 
 #[derive(Debug, Clone, Error)]
-#[error("unsupported name (contains \"/\" or is \".\" or \"..\"): {0:?}")]
+#[error(
+    "unsupported name \
+     (empty, contains \"/\", or is \".\" or \"..\"): {0:?}"
+)]
 pub struct BasenameError(String);
 
 impl<'a> AsRef<Utf8Path> for Basename<'a> {
@@ -456,13 +459,17 @@ impl<'a> AsRef<Utf8Path> for Basename<'a> {
     }
 }
 
+fn is_valid_basename(s: &str) -> bool {
+    !s.is_empty() && !s.contains('/') && s != "." && s != ".."
+}
+
 impl<'a> FromStr for Basename<'a> {
     type Err = BasenameError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.contains("/") || s == "." || s == ".." {
-            Err(BasenameError(s.to_owned()))
-        } else {
+        if is_valid_basename(s) {
             Ok(Basename(Cow::Owned(s.to_owned())))
+        } else {
+            Err(BasenameError(s.to_owned()))
         }
     }
 }
@@ -470,10 +477,10 @@ impl<'a> FromStr for Basename<'a> {
 impl<'a> TryFrom<&'a str> for Basename<'a> {
     type Error = BasenameError;
     fn try_from(s: &'a str) -> Result<Self, Self::Error> {
-        if s.contains("/") || s == "." || s == ".." {
-            Err(BasenameError(s.to_owned()))
-        } else {
+        if is_valid_basename(s) {
             Ok(Basename(Cow::Borrowed(s)))
+        } else {
+            Err(BasenameError(s.to_owned()))
         }
     }
 }
@@ -481,10 +488,10 @@ impl<'a> TryFrom<&'a str> for Basename<'a> {
 impl TryFrom<String> for Basename<'static> {
     type Error = BasenameError;
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        if s.contains("/") || s == "." || s == ".." {
-            Err(BasenameError(s))
-        } else {
+        if is_valid_basename(&s) {
             Ok(Basename(Cow::Owned(s)))
+        } else {
+            Err(BasenameError(s))
         }
     }
 }
@@ -497,14 +504,24 @@ impl TryFrom<String> for Basename<'static> {
 /// the debug data for it), but then that operation fails.  You can attempt to
 /// remove the file in this case to avoid saving useless data, but the
 /// assumption is that it's not a problem if the data was already collected.
-pub enum DepositHandle<'a> {
-    FileSaved { path: Utf8PathBuf, log: &'a Logger },
+#[derive(Debug)]
+pub struct DepositHandle {
+    kind: DepositHandleKind,
+}
+
+#[derive(Debug)]
+enum DepositHandleKind {
+    FileSaved { path: Utf8PathBuf, log: Logger },
     Noop,
 }
 
-impl<'a> DepositHandle<'a> {
-    fn new(path: Utf8PathBuf, log: &'a Logger) -> DepositHandle<'a> {
-        DepositHandle::FileSaved { log, path }
+impl DepositHandle {
+    fn new(path: Utf8PathBuf, log: Logger) -> DepositHandle {
+        DepositHandle { kind: DepositHandleKind::FileSaved { log, path } }
+    }
+
+    fn noop() -> DepositHandle {
+        DepositHandle { kind: DepositHandleKind::Noop }
     }
 
     /// Makes a best-effort to delete the file from the dropbox before it gets
@@ -516,9 +533,9 @@ impl<'a> DepositHandle<'a> {
     /// debug data is no longer useful, but the assumption is that it's not a
     /// problem if it got saved anyway.
     pub async fn cancel_and_attempt_delete(self) {
-        let (path, log) = match self {
-            DepositHandle::FileSaved { path, log } => (path, log),
-            DepositHandle::Noop => return,
+        let (path, log) = match self.kind {
+            DepositHandleKind::FileSaved { path, log } => (path, log),
+            DepositHandleKind::Noop => return,
         };
 
         let path_str = path.to_string();
@@ -789,19 +806,19 @@ mod tests {
         let log = new_test_log();
         let dropbox = DebugDropbox::for_tests_noop(&log);
 
-        for name in [".", "..", "foo/bar"] {
+        for name in [".", "..", "foo/bar", ""] {
             let err = dropbox.initialize_producer(name).await.expect_err(
                 &format!("producer name {name:?} should be rejected"),
             );
             assert!(
                 matches!(err, ProducerInitError::BadBasename(..)),
-                "expected TmpNotAllowed for producer {name:?}, got: {err:?}"
+                "expected BadBasename for producer {name:?}, got: {err:?}"
             );
             assert_eq!(
                 err.to_string(),
                 format!(
-                    "unsupported name (contains \"/\" or is \".\" or \"..\"): \
-                     {name:?}",
+                    "unsupported name (empty, contains \"/\", or is \".\" \
+                     or \"..\"): {name:?}",
                 ),
             );
         }
@@ -834,16 +851,11 @@ mod tests {
             .await
             .expect("noop producer init should succeed");
 
-        for name in [".", "..", "foo/bar"] {
-            // Use .err().unwrap_or_else() rather than .expect_err()
-            // because the latter requires DepositHandle: Debug.
+        for name in [".", "..", "foo/bar", ""] {
             let err = producer
                 .deposit_file_str(name, "contents")
                 .await
-                .err()
-                .unwrap_or_else(|| {
-                    panic!("filename {name:?} should be rejected")
-                });
+                .expect_err(&format!("filename {name:?} should be rejected"));
             assert!(
                 matches!(err, DepositError::BadName(_)),
                 "expected BadName for filename {name:?}, got: {err:?}"
@@ -851,8 +863,8 @@ mod tests {
             assert_eq!(
                 err.to_string(),
                 format!(
-                    "unsupported name (contains \"/\" or is \".\" or \"..\"): \
-                     {name:?}"
+                    "unsupported name (empty, contains \"/\", or is \".\" \
+                     or \"..\"): {name:?}"
                 ),
             );
         }
