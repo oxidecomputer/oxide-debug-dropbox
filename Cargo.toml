@@ -1,0 +1,44 @@
+[package]
+name = "oxide-debug-dropbox"
+version = "0.1.0"
+license = "MPL-2.0"
+edition = "2024"
+repository = "https://github.com/oxidecomputer/oxide-debug-dropbox"
+description = "used with the Oxide system to archive debug data"
+
+# The clippy lint configuration here is largely copied from Omicron.
+[lints.clippy]
+# Clippy's style nits are useful, but not worth keeping in CI.
+style = { level = "allow", priority = -1 }
+# Warn on some more style lints that are relatively stable and make sense.
+iter_cloned_collect = "warn"
+iter_next_slice = "warn"
+iter_nth = "warn"
+iter_nth_zero = "warn"
+iter_skip_next = "warn"
+len_zero = "warn"
+redundant_field_names = "warn"
+# `declare_interior_mutable_const` is classified as a style lint, but it can
+# identify real bugs (e.g., declarying a `const Atomic` and using it like
+# a `static Atomic`). However, it is also subject to false positives (e.g.,
+# idiomatically declaring a static array of atomics uses `const Atomic`). We
+# warn on this to catch the former, and expect any uses of the latter to allow
+# this locally.
+declare_interior_mutable_const = "warn"
+# Also warn on casts, preferring explicit conversions instead.
+#
+# We'd like to warn on lossy casts in the future, but lossless casts are the
+# easiest ones to convert over.
+cast_lossless = "warn"
+
+[dev-dependencies]
+camino-tempfile = "1"
+slog-term = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[dependencies]
+camino = "1.2.1"
+slog = "2.8.2"
+slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain" }
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = [ "fs"] }

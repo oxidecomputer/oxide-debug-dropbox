@@ -1,0 +1,9 @@
+:showtitle:
+:toc: left
+:icons: font
+
+= oxide-debug-dropbox
+
+See https://rfd.shared.oxide.computer/rfd/613[RFD 613 Debug Dropbox].
+
+This component is still undergoing initial development.
