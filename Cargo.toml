@@ -34,6 +34,7 @@ cast_lossless = "warn"
 [dev-dependencies]
 anyhow = "1"
 camino-tempfile = "1"
+clap = { version = "4", features = ["derive"] }
 slog-term = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
