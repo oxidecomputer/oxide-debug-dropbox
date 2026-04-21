@@ -1,5 +1,5 @@
 # We choose a specific toolchain (rather than "stable") for repeatability.  The
 # intent is to keep this up-to-date with recently-released stable Rust.
 [toolchain]
-channel = "1.91.1"
+channel = "1.95.0"
 profile = "default"

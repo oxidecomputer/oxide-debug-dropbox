@@ -1,10 +1,10 @@
 [package]
-name = "oxide-debug-dropbox"
+name = "omicron-debug-dropbox"
 version = "0.1.0"
 license = "MPL-2.0"
 edition = "2024"
-repository = "https://github.com/oxidecomputer/oxide-debug-dropbox"
-description = "used with the Oxide system to archive debug data"
+repository = "https://github.com/oxidecomputer/omicron-debug-dropbox"
+description = "used within Omicron to archive debug data"
 
 # The clippy lint configuration here is largely copied from Omicron.
 [lints.clippy]
@@ -32,12 +32,14 @@ declare_interior_mutable_const = "warn"
 cast_lossless = "warn"
 
 [dev-dependencies]
+anyhow = "1"
 camino-tempfile = "1"
 slog-term = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [dependencies]
 camino = "1.2.1"
+derive_more = { version = "2.1.1", features = ["as_ref"] }
 slog = "2.8.2"
 slog-error-chain = { git = "https://github.com/oxidecomputer/slog-error-chain" }
 thiserror = "2.0.17"

@@ -2,43 +2,176 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// XXX-dap TODO-doc
+//! # Omicron Debug Dropbox
+//!
+//! The Debug Dropbox is a well-known filesystem path into which parts of
+//! [Omicron][1] (the Oxide control plane) can deposit small bits of debug data
+//! that will be archived for possible future use by support.  Logs and core
+//! files for Omicron components are archived via other means.  The dropbox is
+//! for data similar to logs and core files but that's deposited explicitly by
+//! the application.  The motivating example is that whenever Reconfigurator
+//! plans a new blueprint for the system, it saves a file to the dropbox
+//! summarizing all the input that went into the planning process, including the
+//! inventory collection, the parent blueprint, etc.  Having this information
+//! available should make it straightforward to reproduce any surprising planner
+//! behavior seen in the field.  For background, see [RFD 613 Debug Dropbox][2].
+//!
+//! **The debug dropbox should not be used in the global zone, the switch zone,
+//! or any other context where /var is backed by a ramdisk.**
+//!
+//! [1]: https://github.com/oxidecomputer/omicron
+//! [2]: https://rfd.shared.oxide.computer/rfd/0613
+//!
+//! ## Example
+//!
+//! ```no_run
+//! use anyhow::Context;
+//! use omicron_debug_dropbox::DebugDropbox;
+//! use slog::Logger;
+//! use std::sync::Arc;
+//!
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), anyhow::Error> {
+//! // At program startup, initialize the debug dropbox.
+//! // This creates the directory if needed.
+//! let log = todo!(); // create a slog Logger
+//! let debug_dropbox = DebugDropbox::for_non_global_non_switch_zone(&log)
+//!     .await
+//!     .context("creating debug dropbox")?;
+//!
+//! // Also at program startup, initialize a producer.  Each producer is its own
+//! // logical stream or bucket of debug data.  Use this to keep data from
+//! // different components or subsystems separate from each other.
+//! //
+//! // This step deletes any incomplete deposits made before (e.g., due to a
+//! // program crash or system reset), so a given producer name should not be
+//! // used by more than one program.  (That could cause one to delete the
+//! // other's live, in-flight deposits.)
+//! let dropbox_reconfigurator = debug_dropbox
+//!     .initialize_producer("reconfigurator")
+//!     .await
+//!     .context("creating dropbox producer")?;
+//!
+//! // When you want to save debug data, deposit it into the dropbox.
+//! //
+//! // It's up to you whether failure to deposit the file should be bubble
+//! // out to callers.  (If this fails, is it better to proceed with the option
+//! // anyway without the debug data?)
+//! let filename = "my-file";
+//! let contents = "what-I-was-thinking";
+//! let _deposit = dropbox_reconfigurator
+//!     .deposit_file_str(filename, contents)
+//!     .await
+//!     .context("depositing into debug dropbox")?;
+//!
+//! // In many cases, the debugging data is tied to a specific operation (e.g.,
+//! // blueprint planning).  If the operation itself fails, you don't care about
+//! // the debug data any more.  In that case, you can _try_ to cancel the
+//! // deposit using the handle you got.  This is best-effort.  The data may
+//! // already have been archived.
+//! let deposit = dropbox_reconfigurator
+//!     .deposit_file_str(filename, contents)
+//!     .await
+//!     .context("depositing into debug dropbox")?;
+//! # let failed: bool = false;
+//! // ...
+//! if failed {
+//!     deposit.cancel_and_attempt_delete().await;
+//! }
+//! # Ok(())
+//! # } // tokio::main
+//! ```
+//!
+//! ## Producer naming
+//!
+//! See [`DebugDropbox::initialize_producer()`].
+//!
+//! ## File naming
+//!
+//! See [`Producer::deposit_file_str()`].
+//!
+//! ## Deposit and archival
+//!
+//! When depositing data into the dropbox, it initially lands in
+//! `/var/debug_dropbox`.  Sled agent archives data from this directory into the
+//! system's debug datasets periodically as well as when the zone is halted or
+//! after an unexpected system reset.  When the data is archived, the copy in
+//! `/var/debug_dropbox` is deleted.
+//!
+//! While the data is being written, it's staged into a temporary directory
+//! within the dropbox that is not archived by sled agent.  Partially-written
+//! data should never be archived.  If the program crashes or the system resets
+//! with partially-written data in the dropbox, it will be deleted when the same
+//! producer is re-initialized (usually the next time the program starts up).
+//!
+//! ## Guidelines
+//!
+//! **The debug dropbox should not be used in the global zone, the switch zone,
+//! or any other context where /var is backed by a ramdisk.**
+//!
+//! Deposited files can contain any data in any format.  Neither this crate nor
+//! the archival process in sled agent looks at the contents of the files.
+//!
+//! The dropbox is intended for occasional, application-specific debug data that
+//! can be stored in a single file.  These files are expected to be moderately
+//! sized and relatively infrequent.  For concreteness, we suggest:
+//!
+//! * not more than 4 files in any minute
+//! * not more than 1 file per hour on average
+//! * not more than 10 GiB in any file
+//! * not more than 10 GiB per day on average
+//!
+//! These are very rough numbers. They are not enforced. Rather: if you expect
+//! to emit more data than this, use another mechanism to collect it.
+//!
+//! Crash dumps, system-generated core files, and ordinary log files do not
+//! belong in the debug dropbox. Existing mechanisms already handle these.
 
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
+use derive_more::AsRef;
 use slog::Logger;
 use slog::info;
 use slog::o;
 use slog::warn;
 use slog_error_chain::InlineErrorChain;
+use std::borrow::Cow;
+use std::str::FromStr;
 use thiserror::Error;
 
-// Determined in RFD 613 "Debug Dropbox"
+/// Path to the local debug dropbox
+///
+/// This is determined in RFD 613 "Debug Dropbox".  This path represents a
+/// cross-consolidation interface between sled agent (which collects files from
+/// this directory) and components using the dropbox (which deposit them into
+/// this directory).
 pub static DEBUG_DROPBOX_PATH: &str = "/var/debug_dropbox";
 
+/// Errors associated with initializing the debug dropbox
 #[derive(Debug, Error)]
 pub enum DropboxInitError {
     #[error("failed to create directory {0:?}")]
     Mkdir(Utf8PathBuf, #[source] std::io::Error),
 }
 
+/// Errors associated with initializing a debug dropbox producer
 #[derive(Debug, Error)]
 pub enum ProducerInitError {
-    #[error(
-        "producer name is not allowed (cannot be '.', '..', \
-         'tmp', or contain '/'): {0:?}"
-    )]
-    BadName(String),
+    #[error(transparent)]
+    BadBasename(#[from] BasenameError),
+    #[error("producer name \"tmp\" is not allowed")]
+    TmpNotAllowed,
     #[error("failed to create directory {0:?}")]
     Mkdir(Utf8PathBuf, #[source] std::io::Error),
     #[error("failed to clean up directory {0:?}")]
     Cleanup(Utf8PathBuf, #[source] std::io::Error),
 }
 
+/// Errors associated with depositing a file into the dropbox
 #[derive(Debug, Error)]
 pub enum DepositError {
-    #[error("unsupported filename (not a plain file): {0:?}")]
-    BadName(String),
+    #[error(transparent)]
+    BadName(#[from] BasenameError),
     #[error("I/O error on file {0:?}")]
     Io(Utf8PathBuf, #[source] std::io::Error),
     #[error("error renaming {0:?} to {1:?}")]
@@ -47,6 +180,9 @@ pub enum DepositError {
     Fsync(Utf8PathBuf, #[source] std::io::Error),
 }
 
+/// Top-level handle to an initialized debug dropbox
+///
+/// Use [`DebugDropbox::initialize_producer()`] to start depositing files.
 #[derive(Debug)]
 pub struct DebugDropbox {
     log: Logger,
@@ -55,27 +191,49 @@ pub struct DebugDropbox {
 
 #[derive(Debug)]
 enum DebugDropboxKind {
+    /// a normal debug dropbox backed by the given filesystem path
     Normal { path: Utf8PathBuf },
+    /// a "no-op" debug dropbox, where deposits are ignored altogether
+    /// (not written anywhere)
     Noop,
 }
 
 impl DebugDropbox {
+    /// Initializes a debug dropbox for general use
+    ///
+    /// This function's name reflects that the dropbox is not intended for use
+    /// in the global zone or the switch zone.
+    pub async fn for_non_global_non_switch_zone(
+        log: &Logger,
+    ) -> Result<DebugDropbox, DropboxInitError> {
+        DebugDropbox::new_impl(log, Utf8PathBuf::from(DEBUG_DROPBOX_PATH)).await
+    }
+
+    /// Initializes a "no-op" debug dropbox for automated tests
+    ///
+    /// Deposits into this dropbox are completely ignored.  They're not written
+    /// out anywhere.  This is intended for use in automated tests for code that
+    /// uses the debug dropbox, where you want to ignore the dropbox altogether
+    /// in your tests.
     pub fn for_tests_noop(log: &Logger) -> DebugDropbox {
         let log = log.new(o!("component" => "DebugDropbox", "kind" => "noop"));
         DebugDropbox { log, kind: DebugDropboxKind::Noop }
     }
 
+    /// Initializes a debug dropbox for automated tests where deposits are
+    /// written to the specified `path` rather than `DEBUG_DROPBOX_PATH`
+    ///
+    /// These deposits will not be archived anywhere.
+    ///
+    /// This is intended for use in automated tests where you _do_ want a
+    /// program's debug dropbox deposits to be saved, but either don't have a
+    /// real dropbox available or don't want the files archived like they would
+    /// be in the real dropbox.
     pub async fn for_tests(
         log: &Logger,
         path: &Utf8Path,
     ) -> Result<DebugDropbox, DropboxInitError> {
         DebugDropbox::new_impl(log, path.to_owned()).await
-    }
-
-    pub async fn for_non_global_non_switch_zone(
-        log: &Logger,
-    ) -> Result<DebugDropbox, DropboxInitError> {
-        DebugDropbox::new_impl(log, Utf8PathBuf::from(DEBUG_DROPBOX_PATH)).await
     }
 
     async fn new_impl(
@@ -93,17 +251,35 @@ impl DebugDropbox {
         Ok(DebugDropbox { log, kind: DebugDropboxKind::Normal { path } })
     }
 
+    /// Initialize a subdirectory of the dropbox for storing data associated
+    /// with the given `producer` name
+    ///
+    /// Producer names should be distinct for different programs.  There must
+    /// not be two programs on the system with the same producer name running at
+    /// the same time.  When you initialize a producer, partially-written files
+    /// associated with this producer will be deleted on the assumption that
+    /// they're leftover from a crash.
+    ///
+    /// It's okay to use multiple different producer names within a program
+    /// (e.g., for different subsystems whose data you want to keep separate).
+    /// However, a given subsystem should consistently use the same name (i.e.,
+    /// don't include the pid or another changing value in the producer name).
+    ///
+    /// The producer name will become a directory name, so it cannot contain '/'
+    /// or be the strings `"."` or `".."`.  The producer name "tmp" is also
+    /// reserved.
     pub async fn initialize_producer(
         &self,
         producer: &'static str,
     ) -> Result<Producer, ProducerInitError> {
+        // Do the validation even for `Noop` dropboxes.
+
         // "tmp" is reserved for the top-level staging directory.
         if producer == "tmp" {
-            return Err(ProducerInitError::BadName(producer.to_string()));
+            return Err(ProducerInitError::TmpNotAllowed);
         }
-        let Ok(producer_name) = Basename::new(producer) else {
-            return Err(ProducerInitError::BadName(producer.to_string()));
-        };
+
+        let producer_name = Basename::try_from(producer)?;
 
         match &self.kind {
             DebugDropboxKind::Noop => {
@@ -117,9 +293,10 @@ impl DebugDropbox {
                     kind: ProducerKind::Noop,
                 })
             }
+
             DebugDropboxKind::Normal { path } => {
-                let tmp_path = path.join("tmp").join(producer_name.0);
-                let producer_path = path.join(producer_name.0);
+                let tmp_path = path.join("tmp").join(&producer_name);
+                let producer_path = path.join(&producer_name);
                 let log = self.log.new(o!("producer" => producer));
                 info!(
                     log,
@@ -170,6 +347,10 @@ impl DebugDropbox {
     }
 }
 
+/// A bucket or stream of debug data, collected into one directory
+///
+/// Different producers' data winds up in different subdirectories within the
+/// dropbox and (after archival) within the system's debug datasets.
 #[derive(Debug)]
 pub struct Producer {
     log: Logger,
@@ -178,11 +359,21 @@ pub struct Producer {
 
 #[derive(Debug)]
 enum ProducerKind {
+    /// a normal dropbox producer backed by the given filesystem path
     Normal { path: Utf8PathBuf, tmp_path: Utf8PathBuf },
+    /// a "no-op" dropbox producer, where deposits are ignored altogether
+    /// (not written anywhere)
     Noop,
 }
 
 impl Producer {
+    /// Deposit a file called `name` with contents `contents` into the debug
+    /// dropbox, associated with this producer
+    ///
+    /// If a name is duplicated within a short period (i.e., before the first
+    /// one is archived), the new one may overwrite the previous one.  Archived
+    /// files are given unique names, so you don't have to worry about ensuring
+    /// uniqueness over all time.
     pub async fn deposit_file_str<'a>(
         &'a self,
         name: &str,
@@ -190,7 +381,7 @@ impl Producer {
     ) -> Result<DepositHandle<'a>, DepositError> {
         // Validate the name even in Noop mode so that at least this part gets
         // covered in testing.
-        let validated = Basename::new(name)?;
+        let validated = Basename::try_from(name)?;
 
         match &self.kind {
             ProducerKind::Noop => {
@@ -202,8 +393,8 @@ impl Producer {
                 Ok(DepositHandle::Noop)
             }
             ProducerKind::Normal { path, tmp_path } => {
-                let tmp_file_path = tmp_path.join(validated.0);
-                let final_path = path.join(validated.0);
+                let tmp_file_path = tmp_path.join(&validated);
+                let final_path = path.join(&validated);
 
                 info!(
                     &self.log,
@@ -249,14 +440,51 @@ impl Producer {
     }
 }
 
-#[derive(Debug)]
-struct Basename<'a>(&'a str);
-impl<'a> Basename<'a> {
-    fn new(s: &'a str) -> Result<Basename<'a>, DepositError> {
+/// A filesystem path component that's not '.' or '..'
+///
+/// A `Basename` must not contain "/" or be either of the strings "." or "..".
+#[derive(AsRef, Clone, Debug)]
+pub struct Basename<'a>(Cow<'a, str>);
+
+#[derive(Debug, Clone, Error)]
+#[error("unsupported name (contains \"/\" or is \".\" or \"..\"): {0:?}")]
+pub struct BasenameError(String);
+
+impl<'a> AsRef<Utf8Path> for Basename<'a> {
+    fn as_ref(&self) -> &Utf8Path {
+        Utf8Path::new(self.0.as_ref())
+    }
+}
+
+impl<'a> FromStr for Basename<'a> {
+    type Err = BasenameError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.contains("/") || s == "." || s == ".." {
-            Err(DepositError::BadName(s.to_owned()))
+            Err(BasenameError(s.to_owned()))
         } else {
-            Ok(Basename(s))
+            Ok(Basename(Cow::Owned(s.to_owned())))
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a str> for Basename<'a> {
+    type Error = BasenameError;
+    fn try_from(s: &'a str) -> Result<Self, Self::Error> {
+        if s.contains("/") || s == "." || s == ".." {
+            Err(BasenameError(s.to_owned()))
+        } else {
+            Ok(Basename(Cow::Borrowed(s)))
+        }
+    }
+}
+
+impl TryFrom<String> for Basename<'static> {
+    type Error = BasenameError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        if s.contains("/") || s == "." || s == ".." {
+            Err(BasenameError(s))
+        } else {
+            Ok(Basename(Cow::Owned(s)))
         }
     }
 }
@@ -561,22 +789,36 @@ mod tests {
         let log = new_test_log();
         let dropbox = DebugDropbox::for_tests_noop(&log);
 
-        for name in [".", "..", "foo/bar", "tmp"] {
+        for name in [".", "..", "foo/bar"] {
             let err = dropbox.initialize_producer(name).await.expect_err(
                 &format!("producer name {name:?} should be rejected"),
             );
             assert!(
-                matches!(err, ProducerInitError::BadName(_)),
-                "expected BadName for producer {name:?}, got: {err:?}"
+                matches!(err, ProducerInitError::BadBasename(..)),
+                "expected TmpNotAllowed for producer {name:?}, got: {err:?}"
             );
             assert_eq!(
                 err.to_string(),
                 format!(
-                    "producer name is not allowed (cannot be '.', \
-                     '..', 'tmp', or contain '/'): {name:?}"
+                    "unsupported name (contains \"/\" or is \".\" or \"..\"): \
+                     {name:?}",
                 ),
             );
         }
+
+        let name = "tmp";
+        let err = dropbox
+            .initialize_producer(name)
+            .await
+            .expect_err(&format!("producer name {name:?} should be rejected"));
+        assert!(
+            matches!(err, ProducerInitError::TmpNotAllowed),
+            "expected TmpNotAllowed for producer {name:?}, got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("producer name {name:?} is not allowed"),
+        );
     }
 
     /// Test that invalid filenames are rejected when depositing.
@@ -608,7 +850,10 @@ mod tests {
             );
             assert_eq!(
                 err.to_string(),
-                format!("unsupported filename (not a plain file): {name:?}"),
+                format!(
+                    "unsupported name (contains \"/\" or is \".\" or \"..\"): \
+                     {name:?}"
+                ),
             );
         }
     }

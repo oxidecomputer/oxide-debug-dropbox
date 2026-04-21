@@ -2,8 +2,8 @@
 :toc: left
 :icons: font
 
-= oxide-debug-dropbox
+= omicron-debug-dropbox
 
-See https://rfd.shared.oxide.computer/rfd/613[RFD 613 Debug Dropbox].
+The Debug Dropbox is a well-known filesystem path into which parts of https://github.com/oxidecomputer/omicron[Omicron] (the Oxide control plane) can deposit small bits of debug data that will be archived for possible future use by support.  See https://rfd.shared.oxide.computer/rfd/613[RFD 613 Debug Dropbox] for background.
 
-This component is still undergoing initial development.
+This repo contains a crate that's used for dropping debug data into the dropbox.  See the crate documentation for details.
