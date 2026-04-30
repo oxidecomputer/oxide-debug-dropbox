@@ -59,7 +59,7 @@
 //! let filename = "my-file";
 //! let contents = "what-I-was-thinking";
 //! let _deposit = dropbox_reconfigurator
-//!     .deposit_file_str(filename, contents)
+//!     .deposit_file(filename, contents)
 //!     .await
 //!     .context("depositing into debug dropbox")?;
 //!
@@ -69,7 +69,7 @@
 //! // deposit using the handle you got.  This is best-effort.  The data may
 //! // already have been archived.
 //! let deposit = dropbox_reconfigurator
-//!     .deposit_file_str(filename, contents)
+//!     .deposit_file(filename, contents)
 //!     .await
 //!     .context("depositing into debug dropbox")?;
 //! # let failed: bool = false;
@@ -87,7 +87,7 @@
 //!
 //! ## File naming
 //!
-//! See [`Producer::deposit_file_str()`].
+//! See [`Producer::deposit_file()`].
 //!
 //! ## Deposit and archival
 //!
@@ -135,7 +135,6 @@ use slog::o;
 use slog::warn;
 use slog_error_chain::InlineErrorChain;
 use std::borrow::Cow;
-use std::str::FromStr;
 use thiserror::Error;
 
 /// Path to the local debug dropbox
@@ -170,13 +169,29 @@ pub enum ProducerInitError {
 #[derive(Debug, Error)]
 pub enum DepositError {
     #[error(transparent)]
-    BadName(#[from] BasenameError),
-    #[error("I/O error on file {0:?}")]
-    Io(Utf8PathBuf, #[source] std::io::Error),
-    #[error("error renaming {0:?} to {1:?}")]
-    Rename(Utf8PathBuf, Utf8PathBuf, #[source] std::io::Error),
-    #[error("error fsync'ing {0:?}")]
-    Fsync(Utf8PathBuf, #[source] std::io::Error),
+    BadName {
+        #[from]
+        source: BasenameError,
+    },
+    #[error("I/O error on file {path:?}")]
+    Io {
+        path: Utf8PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("error renaming {source_path:?} to {dest_path:?}")]
+    Rename {
+        source_path: Utf8PathBuf,
+        dest_path: Utf8PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("error fsync'ing {path:?}")]
+    Fsync {
+        path: Utf8PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Top-level handle to an initialized debug dropbox
@@ -369,14 +384,15 @@ impl Producer {
     /// Deposit a file called `name` with contents `contents` into the debug
     /// dropbox, associated with this producer
     ///
-    /// If a name is duplicated within a short period (i.e., before the first
-    /// one is archived), the new one may overwrite the previous one.  Archived
-    /// files are given unique names, so you don't have to worry about ensuring
-    /// uniqueness over all time.
-    pub async fn deposit_file_str(
+    /// When the file is ultimately archived by sled agent, it will be given a
+    /// unique name based on the `name` you provide here.  So you don't need to
+    /// ensure that this name is unique for all time.  However, if you deposit
+    /// two files with the same name in a short period (before the first one
+    /// gets archived by sled agent), it will overwrite the previous one.
+    pub async fn deposit_file(
         &self,
         name: &str,
-        contents: &str,
+        contents: impl AsRef<[u8]>,
     ) -> Result<DepositHandle, DepositError> {
         // Validate the name even in Noop mode so that at least this part gets
         // covered in testing.
@@ -405,17 +421,18 @@ impl Producer {
                 match tokio::fs::write(&tmp_file_path, contents).await {
                     Ok(()) => (),
                     Err(error) => {
-                        return Err(DepositError::Io(tmp_file_path, error));
+                        return Err(DepositError::Io {
+                            path: tmp_file_path,
+                            source: error,
+                        });
                     }
                 };
 
                 tokio::fs::rename(&tmp_file_path, &final_path).await.map_err(
-                    |error| {
-                        DepositError::Rename(
-                            tmp_file_path,
-                            final_path.clone(),
-                            error,
-                        )
+                    |error| DepositError::Rename {
+                        source_path: tmp_file_path,
+                        dest_path: final_path.clone(),
+                        source: error,
                     },
                 )?;
 
@@ -423,13 +440,15 @@ impl Producer {
                 for fsync_path in [&final_path, path] {
                     tokio::fs::File::open(fsync_path)
                         .await
-                        .map_err(|error| {
-                            DepositError::Fsync(fsync_path.to_owned(), error)
+                        .map_err(|error| DepositError::Fsync {
+                            path: fsync_path.to_owned(),
+                            source: error,
                         })?
                         .sync_all()
                         .await
-                        .map_err(|error| {
-                            DepositError::Fsync(fsync_path.to_owned(), error)
+                        .map_err(|error| DepositError::Fsync {
+                            path: fsync_path.to_owned(),
+                            source: error,
                         })?;
                 }
 
@@ -461,17 +480,6 @@ impl<'a> AsRef<Utf8Path> for Basename<'a> {
 
 fn is_valid_basename(s: &str) -> bool {
     !s.is_empty() && !s.contains('/') && s != "." && s != ".."
-}
-
-impl<'a> FromStr for Basename<'a> {
-    type Err = BasenameError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if is_valid_basename(s) {
-            Ok(Basename(Cow::Owned(s.to_owned())))
-        } else {
-            Err(BasenameError(s.to_owned()))
-        }
-    }
 }
 
 impl<'a> TryFrom<&'a str> for Basename<'a> {
@@ -634,11 +642,11 @@ mod tests {
         let state_contents = "some state data";
 
         let _h1 = producer
-            .deposit_file_str("blueprint.json", blueprint_contents)
+            .deposit_file("blueprint.json", blueprint_contents)
             .await
             .expect("failed to deposit blueprint.json");
         let _h2 = producer
-            .deposit_file_str("state.txt", state_contents)
+            .deposit_file("state.txt", state_contents)
             .await
             .expect("failed to deposit state.txt");
 
@@ -683,11 +691,11 @@ mod tests {
         let p2_contents = "p2 data";
 
         let _h1 = p1
-            .deposit_file_str("data.txt", p1_contents)
+            .deposit_file("data.txt", p1_contents)
             .await
             .expect("p1 failed to deposit");
         let _h2 = p2
-            .deposit_file_str("data.txt", p2_contents)
+            .deposit_file("data.txt", p2_contents)
             .await
             .expect("p2 failed to deposit");
 
@@ -777,7 +785,7 @@ mod tests {
             .expect("failed to init producer");
 
         let handle = producer
-            .deposit_file_str("state.json", "{}")
+            .deposit_file("state.json", "{}")
             .await
             .expect("failed to deposit");
 
@@ -816,7 +824,7 @@ mod tests {
             .expect("failed to init producer");
 
         let handle = producer
-            .deposit_file_str("state.json", "{}")
+            .deposit_file("state.json", "{}")
             .await
             .expect("failed to deposit");
 
@@ -889,11 +897,11 @@ mod tests {
 
         for name in [".", "..", "foo/bar", ""] {
             let err = producer
-                .deposit_file_str(name, "contents")
+                .deposit_file(name, "contents")
                 .await
                 .expect_err(&format!("filename {name:?} should be rejected"));
             assert!(
-                matches!(err, DepositError::BadName(_)),
+                matches!(err, DepositError::BadName { .. }),
                 "expected BadName for filename {name:?}, got: {err:?}"
             );
             assert_eq!(
@@ -918,7 +926,7 @@ mod tests {
             .expect("noop producer init should succeed");
 
         let handle = producer
-            .deposit_file_str("debug.json", "{}")
+            .deposit_file("debug.json", "{}")
             .await
             .expect("noop deposit should succeed");
 

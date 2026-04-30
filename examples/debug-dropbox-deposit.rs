@@ -91,7 +91,7 @@ async fn run(args: Args, log: Logger) -> Result<()> {
         .context("initialize producer")?;
 
     // Deposit the file.
-    producer.deposit_file_str(&deposit_name, &contents).await.with_context(
+    producer.deposit_file(&deposit_name, &contents).await.with_context(
         || format!("deposit {:?} as {:?}", args.filename, deposit_name),
     )?;
 
