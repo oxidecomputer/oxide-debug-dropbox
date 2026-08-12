@@ -586,7 +586,7 @@ dependencies = [
 [[package]]
 name = "slog-error-chain"
 version = "0.1.0"
-source = "git+https://github.com/oxidecomputer/slog-error-chain#15f69041f45774602108e47fb25e705dc23acfb2"
+source = "git+https://github.com/oxidecomputer/slog-error-chain?branch=main#15f69041f45774602108e47fb25e705dc23acfb2"
 dependencies = [
  "slog",
 ]
