@@ -145,6 +145,12 @@ use thiserror::Error;
 /// this directory).
 pub static DEBUG_DROPBOX_PATH: &str = "/var/debug_dropbox";
 
+/// Producer name that cannot be used by callers
+///
+/// This name is reserved for the top-level staging directory, where deposits
+/// are written before they're complete.
+pub static RESERVED_PRODUCER_NAME: &str = "tmp";
+
 /// Errors associated with initializing the debug dropbox
 #[derive(Debug, Error)]
 pub enum DropboxInitError {
@@ -157,7 +163,7 @@ pub enum DropboxInitError {
 pub enum ProducerInitError {
     #[error(transparent)]
     BadBasename(#[from] BasenameError),
-    #[error("producer name \"tmp\" is not allowed")]
+    #[error("producer name {RESERVED_PRODUCER_NAME:?} is not allowed")]
     TmpNotAllowed,
     #[error("failed to create directory {0:?}")]
     Mkdir(Utf8PathBuf, #[source] std::io::Error),
@@ -281,15 +287,15 @@ impl DebugDropbox {
     ///
     /// The producer name will become a directory name, so it cannot be empty,
     /// cannot contain '/', and cannot be the strings `"."` or `".."`.  The
-    /// producer name "tmp" is also reserved.
+    /// name [`RESERVED_PRODUCER_NAME`] is also not allowed.
     pub async fn initialize_producer(
         &self,
         producer: &str,
     ) -> Result<Producer, ProducerInitError> {
         // Do the validation even for `Noop` dropboxes.
 
-        // "tmp" is reserved for the top-level staging directory.
-        if producer == "tmp" {
+        // This name is reserved for the top-level staging directory.
+        if producer == RESERVED_PRODUCER_NAME {
             return Err(ProducerInitError::TmpNotAllowed);
         }
 
@@ -309,7 +315,8 @@ impl DebugDropbox {
             }
 
             DebugDropboxKind::Normal { path } => {
-                let tmp_path = path.join("tmp").join(&producer_name);
+                let tmp_path =
+                    path.join(RESERVED_PRODUCER_NAME).join(&producer_name);
                 let producer_path = path.join(&producer_name);
                 let log = self.log.new(o!("producer" => producer.to_owned()));
                 info!(
@@ -570,7 +577,9 @@ mod tests {
     use camino_tempfile::Utf8TempDir;
     use slog::{Logger, o};
 
-    use super::{DebugDropbox, DepositError, ProducerInitError};
+    use super::{
+        DebugDropbox, DepositError, ProducerInitError, RESERVED_PRODUCER_NAME,
+    };
 
     fn new_test_log() -> Logger {
         use slog::Drain;
@@ -723,7 +732,7 @@ mod tests {
         let test_dir = TestDir::new();
 
         // Simulate a previous crashed write for p1.
-        let p1_tmp = test_dir.path().join("tmp").join("p1");
+        let p1_tmp = test_dir.path().join(RESERVED_PRODUCER_NAME).join("p1");
         tokio::fs::DirBuilder::new()
             .recursive(true)
             .create(&p1_tmp)
@@ -735,7 +744,7 @@ mod tests {
             .expect("failed to write p1 stale file");
 
         // Simulate an in-progress write for p2.
-        let p2_tmp = test_dir.path().join("tmp").join("p2");
+        let p2_tmp = test_dir.path().join(RESERVED_PRODUCER_NAME).join("p2");
         tokio::fs::DirBuilder::new()
             .recursive(true)
             .create(&p2_tmp)
@@ -867,7 +876,7 @@ mod tests {
             );
         }
 
-        let name = "tmp";
+        let name = RESERVED_PRODUCER_NAME;
         let err = dropbox
             .initialize_producer(name)
             .await
